@@ -1,10 +1,13 @@
 package execution
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -19,6 +22,12 @@ import (
 // AnthropicCLIEngine executes evaluation tasks by shelling out to the
 // Claude Code CLI (`claude`). It reuses Claude Code's agent loop (tool use,
 // multi-turn, MCP) instead of reimplementing it in Go. Auth via ANTHROPIC_API_KEY.
+//
+// The executor speaks `--output-format stream-json` so it can harvest tool_use
+// and tool_result events into resp.ToolCalls/resp.SkillInvocations — that's
+// what powers the tool_calls / tool_constraint / skill_invocation / behavior /
+// action_sequence graders. The final `{"type":"result"}` line carries the
+// same envelope the legacy `--output-format json` path used.
 type AnthropicCLIEngine struct {
 	defaultModelID string
 	binPath        string
@@ -28,8 +37,6 @@ type AnthropicCLIEngine struct {
 	initCalled     atomic.Bool
 }
 
-// NewAnthropicCLIEngine returns an engine that invokes `claude` for each Execute.
-// If claudeBin is empty, the engine looks up `claude` on PATH at Initialize time.
 func NewAnthropicCLIEngine(modelID, claudeBin string) *AnthropicCLIEngine {
 	return &AnthropicCLIEngine{defaultModelID: modelID, binPath: claudeBin}
 }
@@ -48,23 +55,44 @@ func (e *AnthropicCLIEngine) Initialize(ctx context.Context) error {
 	return nil
 }
 
-// claudeJSONResult mirrors the `--output-format json` schema from the Claude Code CLI.
-type claudeJSONResult struct {
-	Type          string `json:"type"`
-	Subtype       string `json:"subtype"`
-	IsError       bool   `json:"is_error"`
-	DurationMs    int64  `json:"duration_ms"`
-	DurationAPIMs int64  `json:"duration_api_ms"`
-	NumTurns      int    `json:"num_turns"`
-	Result        string `json:"result"`
-	SessionID     string `json:"session_id"`
-	TotalCostUSD  float64 `json:"total_cost_usd"`
-	Usage         struct {
-		InputTokens             int `json:"input_tokens"`
-		CacheCreationInputToks  int `json:"cache_creation_input_tokens"`
-		CacheReadInputToks      int `json:"cache_read_input_tokens"`
-		OutputTokens            int `json:"output_tokens"`
-	} `json:"usage"`
+// claudeStreamLine is the union envelope for `--output-format stream-json`.
+// Only the fields we consume are modeled.
+type claudeStreamLine struct {
+	Type      string          `json:"type"`
+	Subtype   string          `json:"subtype,omitempty"`
+	SessionID string          `json:"session_id,omitempty"`
+	Message   json.RawMessage `json:"message,omitempty"`
+	// result envelope
+	IsError      bool    `json:"is_error,omitempty"`
+	DurationMs   int64   `json:"duration_ms,omitempty"`
+	NumTurns     int     `json:"num_turns,omitempty"`
+	Result       string  `json:"result,omitempty"`
+	TotalCostUSD float64 `json:"total_cost_usd,omitempty"`
+	Usage        struct {
+		InputTokens            int `json:"input_tokens"`
+		CacheCreationInputToks int `json:"cache_creation_input_tokens"`
+		CacheReadInputToks     int `json:"cache_read_input_tokens"`
+		OutputTokens           int `json:"output_tokens"`
+	} `json:"usage,omitempty"`
+}
+
+type claudeAssistantMessage struct {
+	Content []claudeMessageBlock `json:"content"`
+}
+
+type claudeMessageBlock struct {
+	Type      string          `json:"type"`
+	Text      string          `json:"text,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Input     json.RawMessage `json:"input,omitempty"`
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+	IsError   bool            `json:"is_error,omitempty"`
+}
+
+type claudeUserMessage struct {
+	Content []claudeMessageBlock `json:"content"`
 }
 
 func (e *AnthropicCLIEngine) Execute(ctx context.Context, req *ExecutionRequest) (*ExecutionResponse, error) {
@@ -80,7 +108,6 @@ func (e *AnthropicCLIEngine) Execute(ctx context.Context, req *ExecutionRequest)
 
 	start := time.Now()
 
-	// Workspace handling — reuse if provided, otherwise create + seed resources.
 	var workspaceDir string
 	if req.WorkspaceDir != "" {
 		workspaceDir = req.WorkspaceDir
@@ -100,7 +127,6 @@ func (e *AnthropicCLIEngine) Execute(ctx context.Context, req *ExecutionRequest)
 		}
 	}
 
-	// Build system prompt: skill body (if requested) + instructions.
 	var systemParts []string
 	if !req.NoSkills {
 		skillDirs := e.skillDirs(req)
@@ -129,10 +155,15 @@ func (e *AnthropicCLIEngine) Execute(ctx context.Context, req *ExecutionRequest)
 	args := []string{
 		"--print",
 		"--bare",
-		"--output-format", "json",
+		"--output-format", "stream-json",
+		"--verbose",
 		"--permission-mode", "bypassPermissions",
-		"--no-session-persistence",
 		"--add-dir", workspaceDir,
+	}
+	// Ephemeral graders should never persist. Task runs allow persistence so
+	// callers can chain multi-turn sessions via SessionID.
+	if req.EphemeralSession {
+		args = append(args, "--no-session-persistence")
 	}
 	if modelID != "" {
 		args = append(args, "--model", modelID)
@@ -148,57 +179,183 @@ func (e *AnthropicCLIEngine) Execute(ctx context.Context, req *ExecutionRequest)
 	cmd.Stdin = strings.NewReader(req.Message)
 	cmd.Dir = workspaceDir
 
-	out, runErr := cmd.Output()
-	durMs := time.Since(start).Milliseconds()
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start claude: %w", err)
+	}
 
 	resp := &ExecutionResponse{
-		Events:       []copilot.SessionEvent{},
-		ModelID:      modelID,
-		DurationMs:   durMs,
-		ToolCalls:    []models.ToolCall{},
-		WorkspaceDir: workspaceDir,
+		Events:           []copilot.SessionEvent{},
+		ModelID:          modelID,
+		ToolCalls:        []models.ToolCall{},
+		SkillInvocations: []SkillInvocation{},
+		WorkspaceDir:     workspaceDir,
 	}
+
+	finalEnvelope, parseErr := streamParse(stdout, resp)
+	waitErr := cmd.Wait()
+
+	resp.DurationMs = time.Since(start).Milliseconds()
 	if !req.SkipWorkspaceCapture {
 		resp.WorkspaceFiles = captureWorkspaceFiles(workspaceDir)
 	}
 
-	// claude --print --output-format json emits the result envelope on stdout
-	// even when it reports an error (is_error: true) and exits non-zero. Try
-	// to parse stdout first; fall back to surfacing the exec error only when
-	// stdout doesn't contain a JSON envelope.
-	var parsed claudeJSONResult
-	parseErr := json.Unmarshal(out, &parsed)
-
-	if parseErr == nil {
-		resp.FinalOutput = parsed.Result
-		resp.SessionID = parsed.SessionID
-		resp.Success = !parsed.IsError
-		if parsed.IsError {
-			resp.ErrorMsg = parsed.Result
+	if finalEnvelope != nil {
+		resp.FinalOutput = finalEnvelope.Result
+		resp.SessionID = finalEnvelope.SessionID
+		resp.Success = !finalEnvelope.IsError
+		if finalEnvelope.IsError {
+			resp.ErrorMsg = finalEnvelope.Result
 		}
-	} else if runErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(runErr, &exitErr) {
-			resp.ErrorMsg = fmt.Sprintf("claude exited %d: %s", exitErr.ExitCode(), strings.TrimSpace(string(exitErr.Stderr)))
-		} else {
-			resp.ErrorMsg = runErr.Error()
+		resp.Usage = &models.UsageStats{
+			Turns:            finalEnvelope.NumTurns,
+			InputTokens:      finalEnvelope.Usage.InputTokens,
+			OutputTokens:     finalEnvelope.Usage.OutputTokens,
+			CacheReadTokens:  finalEnvelope.Usage.CacheReadInputToks,
+			CacheWriteTokens: finalEnvelope.Usage.CacheCreationInputToks,
 		}
-		resp.Success = false
-		return resp, nil
 	} else {
-		resp.ErrorMsg = fmt.Sprintf("parse claude json: %v; raw=%s", parseErr, truncate(string(out), 512))
+		// No result line — surface whatever we got from stderr / exit error.
 		resp.Success = false
-		return resp, nil
-	}
-	resp.Usage = &models.UsageStats{
-		Turns:            parsed.NumTurns,
-		InputTokens:      parsed.Usage.InputTokens,
-		OutputTokens:     parsed.Usage.OutputTokens,
-		CacheReadTokens:  parsed.Usage.CacheReadInputToks,
-		CacheWriteTokens: parsed.Usage.CacheCreationInputToks,
+		if waitErr != nil {
+			var exitErr *exec.ExitError
+			if errors.As(waitErr, &exitErr) {
+				resp.ErrorMsg = fmt.Sprintf("claude exited %d: %s", exitErr.ExitCode(), strings.TrimSpace(stderrBuf.String()))
+			} else {
+				resp.ErrorMsg = waitErr.Error()
+			}
+		} else if parseErr != nil {
+			resp.ErrorMsg = fmt.Sprintf("parse claude stream: %v", parseErr)
+		} else if stderrBuf.Len() > 0 {
+			resp.ErrorMsg = strings.TrimSpace(stderrBuf.String())
+		} else {
+			resp.ErrorMsg = "claude produced no result envelope"
+		}
 	}
 
 	return resp, nil
+}
+
+// streamParse reads claude's stream-json output and populates tool/skill
+// invocations on resp. The final `result` line is returned so the caller can
+// fill in totals (session id, usage, success flag).
+func streamParse(r io.Reader, resp *ExecutionResponse) (*claudeStreamLine, error) {
+	pending := map[string]*models.ToolCall{}
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 1<<20), 64<<20)
+
+	var finalLine *claudeStreamLine
+
+	for scanner.Scan() {
+		raw := scanner.Bytes()
+		if len(bytes.TrimSpace(raw)) == 0 {
+			continue
+		}
+		var line claudeStreamLine
+		if err := json.Unmarshal(raw, &line); err != nil {
+			continue
+		}
+
+		switch line.Type {
+		case "assistant":
+			if len(line.Message) == 0 {
+				continue
+			}
+			var msg claudeAssistantMessage
+			if err := json.Unmarshal(line.Message, &msg); err != nil {
+				continue
+			}
+			for _, block := range msg.Content {
+				if block.Type != "tool_use" || block.ID == "" {
+					continue
+				}
+				args := decodeToolArgs(block.Input)
+				tc := &models.ToolCall{
+					Name:      block.Name,
+					Arguments: args,
+				}
+				pending[block.ID] = tc
+				if block.Name == "Skill" && args.Skill != "" {
+					resp.SkillInvocations = append(resp.SkillInvocations, SkillInvocation{Name: args.Skill})
+				}
+			}
+		case "user":
+			if len(line.Message) == 0 {
+				continue
+			}
+			var msg claudeUserMessage
+			if err := json.Unmarshal(line.Message, &msg); err != nil {
+				continue
+			}
+			for _, block := range msg.Content {
+				if block.Type != "tool_result" || block.ToolUseID == "" {
+					continue
+				}
+				tc, ok := pending[block.ToolUseID]
+				if !ok {
+					continue
+				}
+				tc.Success = !block.IsError
+				resp.ToolCalls = append(resp.ToolCalls, *tc)
+				delete(pending, block.ToolUseID)
+			}
+		case "result":
+			cp := line
+			finalLine = &cp
+		}
+	}
+	// Any tool_use that never got a tool_result still counts as an attempted call.
+	for _, tc := range pending {
+		tc.Success = false
+		resp.ToolCalls = append(resp.ToolCalls, *tc)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return finalLine, fmt.Errorf("scan stream: %w", err)
+	}
+	return finalLine, nil
+}
+
+func decodeToolArgs(input json.RawMessage) models.ToolCallArgs {
+	if len(input) == 0 {
+		return models.ToolCallArgs{}
+	}
+	var raw struct {
+		Path        string `json:"path"`
+		FilePath    string `json:"file_path"`
+		FileText    string `json:"file_text"`
+		Content     string `json:"content"`
+		Command     string `json:"command"`
+		Description string `json:"description"`
+		Skill       string `json:"skill"`
+		SkillName   string `json:"skill_name"`
+	}
+	_ = json.Unmarshal(input, &raw)
+	path := raw.Path
+	if path == "" {
+		path = raw.FilePath
+	}
+	fileText := raw.FileText
+	if fileText == "" {
+		fileText = raw.Content
+	}
+	skill := raw.Skill
+	if skill == "" {
+		skill = raw.SkillName
+	}
+	return models.ToolCallArgs{
+		Path:        path,
+		FileText:    fileText,
+		Command:     raw.Command,
+		Description: raw.Description,
+		Skill:       skill,
+	}
 }
 
 func (e *AnthropicCLIEngine) Shutdown(ctx context.Context) error {
@@ -216,9 +373,6 @@ func (e *AnthropicCLIEngine) Shutdown(ctx context.Context) error {
 
 func (e *AnthropicCLIEngine) SessionUsage(sessionID string) *models.UsageStats { return nil }
 
-// skillDirs replicates the relevant subset of CopilotEngine.getSkillDirs.
-// It returns the directories to scan for SKILL.md files when building the
-// system prompt for a task.
 func (e *AnthropicCLIEngine) skillDirs(req *ExecutionRequest) []string {
 	var dirs []string
 	if req.SourceDir != "" {
@@ -241,11 +395,4 @@ func normalizeAnthropicModelID(id string) string {
 	default:
 		return id
 	}
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "...(truncated)"
 }

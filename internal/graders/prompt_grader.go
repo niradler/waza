@@ -67,15 +67,23 @@ func (p *promptGrader) gradeIndependent(ctx context.Context, gradingContext *Con
 			return nil, errors.New("prompt grader requires grading context")
 		}
 		resumeID := ""
+		message := p.args.Prompt
 		if p.args.ContinueSession {
 			if gradingContext.SessionID == "" {
 				return nil, errors.New("no session id set, can't continue session in prompt grading")
 			}
 			resumeID = gradingContext.SessionID
+		} else {
+			// Independent (no session resume) judges run as fresh sessions and
+			// would otherwise never see the candidate output. Inject it
+			// explicitly along with a structured-verdict directive so
+			// executors that can't surface tool calls (e.g. anthropic-cli)
+			// still produce parseable PASS/FAIL signal.
+			message = buildIndependentJudgePrompt(p.args.Prompt, gradingContext.Output)
 		}
 		resp, err := executePromptGrader(ctx, gradingContext, &execution.ExecutionRequest{
 			ModelID:              p.args.Model,
-			Message:              p.args.Prompt,
+			Message:              message,
 			Tools:                wazaTools.Tools,
 			MessageMode:          execution.MessageModeEnqueue,
 			Streaming:            true,
@@ -105,6 +113,20 @@ func (p *promptGrader) gradeIndependent(ctx context.Context, gradingContext *Con
 				"err", promptGraderErrorMessage(resp, err), "passes", len(wazaTools.Passes), "failures", len(wazaTools.Failures))
 		}
 
+		respContent := "<no response content>"
+		if resp != nil && strings.TrimSpace(resp.FinalOutput) != "" {
+			respContent = resp.FinalOutput
+		}
+
+		// Executors that don't surface Go-side tool handlers (e.g. anthropic-cli
+		// shelling out to `claude`) won't populate wazaTools. Fall back to
+		// parsing structured verdict lines we asked the judge to emit.
+		if !p.args.ContinueSession && len(wazaTools.Passes) == 0 && len(wazaTools.Failures) == 0 && resp != nil {
+			parsePasses, parseFailures := parseStructuredVerdict(resp.FinalOutput)
+			wazaTools.Passes = append(wazaTools.Passes, parsePasses...)
+			wazaTools.Failures = append(wazaTools.Failures, parseFailures...)
+		}
+
 		var score = 0.0
 		total := len(wazaTools.Failures) + len(wazaTools.Passes)
 
@@ -112,11 +134,6 @@ func (p *promptGrader) gradeIndependent(ctx context.Context, gradingContext *Con
 			// Can happen if they possibly messed up (we didn't get any failures or successes)
 			// We'll fail the test, and avoid a divide by zero.
 			score = float64(len(wazaTools.Passes)) / float64(total)
-		}
-
-		respContent := "<no response content>"
-		if resp != nil && strings.TrimSpace(resp.FinalOutput) != "" {
-			respContent = resp.FinalOutput
 		}
 
 		feedback := AllPromptsPassed
@@ -421,6 +438,56 @@ func normalizePairwiseWinner(winner, labelA, labelB, semanticA, semanticB string
 	default:
 		return "tie"
 	}
+}
+
+// buildIndependentJudgePrompt wraps the rubric with the candidate output and a
+// directive that asks the judge to emit one structured verdict line per check.
+// This is what lets text-stream executors (anthropic-cli) report grades even
+// though they can't invoke Go-side tool handlers.
+func buildIndependentJudgePrompt(rubric, candidateOutput string) string {
+	candidate := strings.TrimSpace(candidateOutput)
+	if candidate == "" {
+		candidate = "<no candidate output captured>"
+	}
+	var sb strings.Builder
+	sb.WriteString("You are a strict evaluator. Apply the rubric below to the candidate output.\n\n")
+	sb.WriteString("## Rubric\n")
+	sb.WriteString(strings.TrimSpace(rubric))
+	sb.WriteString("\n\n## Candidate Output\n```\n")
+	sb.WriteString(candidate)
+	sb.WriteString("\n```\n\n")
+	sb.WriteString("## How to report\n")
+	sb.WriteString("If the `set_waza_grade_pass` / `set_waza_grade_fail` tools are available, call them.\n")
+	sb.WriteString("Otherwise, emit one line per check using exactly this format:\n")
+	sb.WriteString("    WAZA-GRADE: PASS — <check name>: <one-line reason>\n")
+	sb.WriteString("    WAZA-GRADE: FAIL — <check name>: <one-line reason>\n")
+	sb.WriteString("Emit at least one WAZA-GRADE line. Do not wrap them in code fences.\n")
+	return sb.String()
+}
+
+// parseStructuredVerdict scans judge output for `WAZA-GRADE: PASS|FAIL` lines.
+// Used when executor cannot invoke Go-side tool handlers (anthropic-cli).
+func parseStructuredVerdict(text string) (passes, failures []string) {
+	for _, raw := range strings.Split(text, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		upper := strings.ToUpper(line)
+		idx := strings.Index(upper, "WAZA-GRADE:")
+		if idx < 0 {
+			continue
+		}
+		body := strings.TrimSpace(line[idx+len("WAZA-GRADE:"):])
+		bodyUpper := strings.ToUpper(body)
+		switch {
+		case strings.HasPrefix(bodyUpper, "PASS"):
+			passes = append(passes, strings.TrimSpace(strings.TrimPrefix(body, body[:4])))
+		case strings.HasPrefix(bodyUpper, "FAIL"):
+			failures = append(failures, strings.TrimSpace(strings.TrimPrefix(body, body[:4])))
+		}
+	}
+	return passes, failures
 }
 
 func pairwiseWinnerToScore(winner string) float64 {
