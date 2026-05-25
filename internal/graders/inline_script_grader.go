@@ -211,6 +211,13 @@ func getStdinTextForScript(gradingContext *Context, assertions []string) ([]byte
 
 	toolCalls := models.FilterToolCalls(sessionEvents)
 
+	// When the executor doesn't surface copilot session events (e.g. anthropic-cli
+	// shelling out to `claude`), fall back to the session digest the runner built
+	// from the executor's resp.ToolCalls.
+	if len(toolCalls) == 0 && gradingContext.Session != nil && len(gradingContext.Session.ToolCalls) > 0 {
+		toolCalls = gradingContext.Session.ToolCalls
+	}
+
 	if toolCalls == nil {
 		toolCalls = []models.ToolCall{}
 	}

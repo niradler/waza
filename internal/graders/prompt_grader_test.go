@@ -86,7 +86,8 @@ func TestPromptGraderUsesExecutorTools(t *testing.T) {
 	executor := &fakePromptExecutor{
 		execute: func(req *execution.ExecutionRequest) (*execution.ExecutionResponse, error) {
 			require.Equal(t, "judge-model", req.ModelID)
-			require.Equal(t, "grade this", req.Message)
+			require.Contains(t, req.Message, "grade this")
+			require.Contains(t, req.Message, "## Candidate Output")
 			require.Equal(t, execution.MessageModeEnqueue, req.MessageMode)
 			require.True(t, req.Streaming)
 			require.True(t, req.EphemeralSession)

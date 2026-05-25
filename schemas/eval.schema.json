@@ -130,9 +130,10 @@
           "type": "string",
           "enum": [
             "copilot-sdk",
+            "anthropic-cli",
             "mock"
           ],
-          "description": "Execution engine to use. 'copilot-sdk' for real evaluations, 'mock' for testing."
+          "description": "Execution engine to use. 'copilot-sdk' for real evaluations, 'anthropic-cli' shells out to the Claude Code CLI (reads ANTHROPIC_API_KEY), 'mock' for testing."
         },
         "model": {
           "type": "string",

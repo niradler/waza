@@ -37,9 +37,11 @@ func (jsg *jsonSchemaGrader) Kind() models.GraderKind { return models.GraderKind
 
 func (jsg *jsonSchemaGrader) Grade(ctx context.Context, gradingContext *Context) (*models.GraderResults, error) {
 	return measureTime(func() (*models.GraderResults, error) {
-		// Step 1: check if the output is valid JSON
+		// Step 1: check if the output is valid JSON. Falls back to a fenced
+		// ```json``` block when the candidate wraps JSON in a markdown report.
 		var outputValue any
-		if err := json.Unmarshal([]byte(gradingContext.Output), &outputValue); err != nil {
+		candidate := extractJSONPayload(gradingContext.Output)
+		if err := json.Unmarshal([]byte(candidate), &outputValue); err != nil {
 			return &models.GraderResults{
 				Name:     jsg.name,
 				Type:     models.GraderKindJSONSchema,
@@ -135,4 +137,102 @@ func validateAgainstSchema(value any, schemaMap map[string]any) ([]string, error
 	}
 
 	return nil, nil
+}
+
+// extractJSONPayload returns a JSON-parseable substring from output. It first
+// tries the raw output; if that fails, it scans for a fenced ```json``` (or
+// bare ```) block; if still nothing, it falls back to the longest balanced
+// {...} or [...] segment in the text.
+func extractJSONPayload(out string) string {
+	trimmed := strings.TrimSpace(out)
+	if trimmed == "" {
+		return trimmed
+	}
+	var probe any
+	if json.Unmarshal([]byte(trimmed), &probe) == nil {
+		return trimmed
+	}
+	if block := findFencedJSON(trimmed); block != "" {
+		return block
+	}
+	if block := findBalancedJSON(trimmed); block != "" {
+		return block
+	}
+	return trimmed
+}
+
+func findFencedJSON(s string) string {
+	for _, marker := range []string{"```json", "```JSON", "```"} {
+		idx := strings.Index(s, marker)
+		if idx < 0 {
+			continue
+		}
+		rest := s[idx+len(marker):]
+		end := strings.Index(rest, "```")
+		if end < 0 {
+			continue
+		}
+		candidate := strings.TrimSpace(rest[:end])
+		if candidate == "" {
+			continue
+		}
+		var probe any
+		if json.Unmarshal([]byte(candidate), &probe) == nil {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func findBalancedJSON(s string) string {
+	for _, open := range []byte{'{', '['} {
+		close := byte('}')
+		if open == '[' {
+			close = ']'
+		}
+		start := strings.IndexByte(s, open)
+		for start >= 0 {
+			depth := 0
+			inStr := false
+			esc := false
+			for i := start; i < len(s); i++ {
+				c := s[i]
+				if inStr {
+					if esc {
+						esc = false
+						continue
+					}
+					if c == '\\' {
+						esc = true
+						continue
+					}
+					if c == '"' {
+						inStr = false
+					}
+					continue
+				}
+				switch c {
+				case '"':
+					inStr = true
+				case open:
+					depth++
+				case close:
+					depth--
+					if depth == 0 {
+						candidate := s[start : i+1]
+						var probe any
+						if json.Unmarshal([]byte(candidate), &probe) == nil {
+							return candidate
+						}
+					}
+				}
+			}
+			next := strings.IndexByte(s[start+1:], open)
+			if next < 0 {
+				break
+			}
+			start = start + 1 + next
+		}
+	}
+	return ""
 }
